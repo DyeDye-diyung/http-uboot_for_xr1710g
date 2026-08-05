@@ -66,7 +66,6 @@ ulong airoha_recovery_get_lan_activity_ms(void);
 
 /* Delay before reboot after flashing completes, to let browser finish reads */
 #define REBOOT_DELAY_MS        3000
-#define FLASH_START_DELAY_MS   3000
 #define RECOVERY_STATIC_IPADDR           "192.168.255.1"
 #define RECOVERY_STATIC_NETMASK          "255.255.255.0"
 #define RECOVERY_STATIC_GATEWAY          "0.0.0.0"
@@ -170,12 +169,6 @@ static void recovery_lwip_cleanup(struct netif *netif)
 	recovery_httpd_started = false;
 }
 
-static void post_delay_cb(void *arg)
-{
-    (void)arg;
-    flash_request = 1;
-}
-
 static void reboot_delay_cb(void *arg)
 {
     (void)arg;
@@ -184,7 +177,6 @@ static void reboot_delay_cb(void *arg)
 
 static void recovery_cancel_timeouts(void)
 {
-	sys_untimeout(post_delay_cb, NULL);
 	sys_untimeout(reboot_delay_cb, NULL);
 	flash_request = 0;
 	reboot_request = 0;
@@ -2595,7 +2587,7 @@ static int recovery_open_custom_response(struct fs_file *file,
 
 	file->data = page;
 	file->len = total_len;
-	file->index = 0;
+	file->index = file->len;
 	file->flags = FS_FILE_FLAGS_HEADER_INCLUDED;
 	return 1;
 }
@@ -2633,11 +2625,11 @@ int fs_open_custom(struct fs_file *file, const char *name)
 					     json, json_len);
 	    }
 	    else if (!strcmp(p, "ok")) {
-	        file->data = recovery_page_ok;
-	        file->len = sizeof(recovery_page_ok) - 1;
-	        file->index = 0;
-	        file->flags = FS_FILE_FLAGS_HEADER_INCLUDED;
-	        return 1;
+		file->data = recovery_page_ok;
+		file->len = sizeof(recovery_page_ok) - 1;
+		file->index = file->len;
+		file->flags = FS_FILE_FLAGS_HEADER_INCLUDED;
+		return 1;
 	    }
 	    else if (!strcmp(p, "about")) {
 	        char json[256];
@@ -2688,7 +2680,7 @@ int fs_read_custom(struct fs_file *file, char *buffer, int count)
     return count;
 }
 
-/* bytes_left for custom files is handled by fs_read_custom + file->index; */
+/* Complete custom responses are supplied in file->data by fs_open_custom(). */
 
 /* HTTP POST handlers */
 err_t httpd_post_begin(void *connection, const char *uri, const char *http_request,
@@ -2854,21 +2846,41 @@ err_t httpd_post_receive_data(void *connection, struct pbuf *p)
 
 void httpd_post_finished(void *connection, char *response_uri, u16_t response_uri_len)
 {
-    (void)connection;
-    printf("httpd: post finished, %u/%u bytes received\n", recv_off, recv_total);
-    /* Tell httpd which page to return after POST (keep user on main page) */
-    if (post_ok && recv_total && (recv_off >= recv_total))
-        strlcpy(response_uri, "/ok", response_uri_len);
-    else
-        strlcpy(response_uri, "/fail.html", response_uri_len);
+	bool upload_complete;
 
-    /*
-     * Delay flashing slightly so the browser can finish receiving the POST
-     * response before erase/write work blocks the network loop.
-     */
-    if (post_ok && recv_total && (recv_off >= recv_total))
-        sys_timeout(FLASH_START_DELAY_MS, post_delay_cb, NULL);
+	(void)connection;
+	printf("httpd: post finished, %u/%u bytes received\n", recv_off, recv_total);
+	upload_complete = post_ok && recv_total && (recv_off >= recv_total);
+	if (upload_complete) {
+		strlcpy(response_uri, "/ok", response_uri_len);
+		printf("httpd: upload received; waiting for POST response ACK\n");
+	} else {
+		strlcpy(response_uri, "/fail.html", response_uri_len);
+		post_ok = 0;
+		prog_phase = -1;
+	}
 }
+
+#if LWIP_HTTPD_POST_RESPONSE_ACK
+void httpd_post_response_complete(void *connection, err_t result)
+{
+	(void)connection;
+
+	if (!post_ok || !recv_total || recv_off < recv_total)
+		return;
+
+	if (result != ERR_OK) {
+		printf("httpd: POST response not acknowledged (%d); flash cancelled\n",
+		       result);
+		post_ok = 0;
+		prog_phase = -1;
+		return;
+	}
+
+	printf("httpd: POST response acknowledged; flashing may start\n");
+	flash_request = 1;
+}
+#endif
 
 static int flash_image(struct recovery_status_led_ctrl *status_leds)
 {
